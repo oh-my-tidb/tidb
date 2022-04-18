@@ -686,6 +686,24 @@ func (cc *clientConn) readOptionalSSLRequestAndHandshakeResponse(ctx context.Con
 		return err
 	}
 
+	if resp.DBName == "" {
+		err = errors.New("cluster id is not privided")
+		terror.Log(err)
+		return err
+	}
+
+	var clusterID string
+	if splits := strings.SplitN(resp.DBName, ".", 2); len(splits) == 1 {
+		clusterID, resp.DBName = splits[0], ""
+	} else {
+		clusterID, resp.DBName = splits[0], splits[1]
+	}
+	if clusterID != "42" {
+		err = fmt.Errorf("cluster %s not found", clusterID)
+		terror.Log(err)
+		return err
+	}
+
 	cc.capability = resp.Capability & cc.server.capability
 	cc.user = resp.User
 	cc.dbname = resp.DBName
