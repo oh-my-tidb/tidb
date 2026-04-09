@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
 	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/kv"
@@ -124,6 +125,7 @@ func TestString(t *testing.T) {
 				CommitBackoffTypes   []string
 				SlowestPrewrite      util.ReqDetailInfo
 				CommitPrimary        util.ReqDetailInfo
+				WriteRUV2            *kvrpcpb.RUV2
 			}{
 				CommitBackoffTime: int64(time.Second),
 				PrewriteBackoffTypes: []string{
@@ -515,6 +517,7 @@ func TestRuntimeStatsWithCommit(t *testing.T) {
 			CommitBackoffTypes   []string
 			SlowestPrewrite      util.ReqDetailInfo
 			CommitPrimary        util.ReqDetailInfo
+			WriteRUV2            *kvrpcpb.RUV2
 		}{
 			CommitBackoffTime:    int64(time.Second),
 			PrewriteBackoffTypes: []string{"backoff1", "backoff2", "backoff1"},
