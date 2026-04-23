@@ -14,7 +14,7 @@
 # limitations under the License.
 
 set -eu
-trap 'set +e; PIDS=$(jobs -p); [ -n "$PIDS" ] && kill -9 $PIDS' EXIT
+trap 'set +e; PIDS=$(jobs -p); for pid in $PIDS; do kill -9 $pid 2>/dev/null || true; done' EXIT
 
 function help_message()
 {
@@ -81,6 +81,8 @@ done
 
 clean_cluster
 
+# Run specified test case(s) by `-test.run` argument.
+# E.g.: go_tests -test.run UpgradeAndDowngrade$
 go_tests
 
 clean_cluster

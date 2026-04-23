@@ -14,7 +14,6 @@
 
 package main
 
-// #nosec G108
 import (
 	"context"
 	"flag"
@@ -28,9 +27,9 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/parser/terror"
-	"github.com/pingcap/tidb/store/driver"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/store/driver"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
@@ -92,10 +91,10 @@ func batchRW(value []byte) {
 	wg := sync.WaitGroup{}
 	base := *dataCnt / *workerCnt
 	wg.Add(*workerCnt)
-	for i := 0; i < *workerCnt; i++ {
+	for i := range *workerCnt {
 		go func(i int) {
 			defer wg.Done()
-			for j := 0; j < base; j++ {
+			for j := range base {
 				txnCounter.WithLabelValues("txn").Inc()
 				start := time.Now()
 				k := base*i + j

@@ -8,15 +8,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	tcontext "github.com/pingcap/tidb/dumpling/context"
 	"github.com/stretchr/testify/require"
-
-	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestPrepareDumpingDatabases(t *testing.T) {
-	t.Parallel()
-
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() {
@@ -65,8 +62,6 @@ func TestPrepareDumpingDatabases(t *testing.T) {
 }
 
 func TestListAllTables(t *testing.T) {
-	t.Parallel()
-
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() {
@@ -84,19 +79,19 @@ func TestListAllTables(t *testing.T) {
 		AppendViews("db3", "t6", "t7", "t8")
 
 	dbNames := make([]databaseName, 0, len(data))
-	rows := sqlmock.NewRows([]string{"TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "AVG_ROW_LENGTH"})
 	for dbName, tableInfos := range data {
 		dbNames = append(dbNames, dbName)
 
+		query := "SELECT TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=\\? AND \\(TABLE_TYPE='BASE TABLE'\\)"
+		rows := sqlmock.NewRows([]string{"TABLE_NAME", "TABLE_TYPE", "AVG_ROW_LENGTH"})
 		for _, tbInfo := range tableInfos {
 			if tbInfo.Type == TableTypeView {
 				continue
 			}
-			rows.AddRow(dbName, tbInfo.Name, tbInfo.Type.String(), tbInfo.AvgRowLength)
+			rows.AddRow(tbInfo.Name, tbInfo.Type.String(), tbInfo.AvgRowLength)
 		}
+		mock.ExpectQuery(query).WithArgs(dbName).WillReturnRows(rows)
 	}
-	query := "SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
-	mock.ExpectQuery(query).WillReturnRows(rows)
 
 	tables, err := ListAllDatabasesTables(tctx, conn, dbNames, listTableByInfoSchema, TableTypeBase)
 	require.NoError(t, err)
@@ -104,7 +99,7 @@ func TestListAllTables(t *testing.T) {
 	for d, table := range tables {
 		expectedTbs, ok := data[d]
 		require.True(t, ok)
-		for i := 0; i < len(table); i++ {
+		for i := range table {
 			require.Truef(t, table[i].Equals(expectedTbs[i]), "%v mismatches expected: %v", table[i], expectedTbs[i])
 		}
 	}
@@ -113,15 +108,15 @@ func TestListAllTables(t *testing.T) {
 	data = NewDatabaseTables().
 		AppendTables("db", []string{"t1"}, []uint64{1}).
 		AppendViews("db", "t2")
-	query = "SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' OR TABLE_TYPE='VIEW'"
-	mock.ExpectQuery(query).WillReturnRows(sqlmock.NewRows([]string{"TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "AVG_ROW_LENGTH"}).
-		AddRow("db", "t1", TableTypeBaseStr, 1).AddRow("db", "t2", TableTypeViewStr, nil))
+	query := "SELECT TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=\\? AND \\(TABLE_TYPE='BASE TABLE' OR TABLE_TYPE='VIEW'\\)"
+	mock.ExpectQuery(query).WithArgs("db").WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME", "TABLE_TYPE", "AVG_ROW_LENGTH"}).
+		AddRow("t1", TableTypeBaseStr, 1).AddRow("t2", TableTypeViewStr, nil))
 	tables, err = ListAllDatabasesTables(tctx, conn, []string{"db"}, listTableByInfoSchema, TableTypeBase, TableTypeView)
 	require.NoError(t, err)
 	require.Len(t, tables, 1)
 	require.Len(t, tables["db"], 2)
 
-	for i := 0; i < len(tables["db"]); i++ {
+	for i := range tables["db"] {
 		require.Truef(t, tables["db"][i].Equals(data["db"][i]), "%v mismatches expected: %v", tables["db"][i], data["db"][i])
 	}
 
@@ -129,8 +124,6 @@ func TestListAllTables(t *testing.T) {
 }
 
 func TestListAllTablesByTableStatus(t *testing.T) {
-	t.Parallel()
-
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() {
@@ -172,7 +165,7 @@ func TestListAllTablesByTableStatus(t *testing.T) {
 		expectedTbs, ok := data[d]
 		require.True(t, ok)
 
-		for i := 0; i < len(table); i++ {
+		for i := range table {
 			require.Truef(t, table[i].Equals(expectedTbs[i]), "%v mismatches expected: %v", table[i], expectedTbs[i])
 		}
 	}
@@ -189,7 +182,7 @@ func TestListAllTablesByTableStatus(t *testing.T) {
 	require.Len(t, tables, 1)
 	require.Len(t, tables["db"], 2)
 
-	for i := 0; i < len(tables["db"]); i++ {
+	for i := range tables["db"] {
 		require.Truef(t, tables["db"][i].Equals(data["db"][i]), "%v mismatches expected: %v", tables["db"][i], data["db"][i])
 	}
 
@@ -197,8 +190,6 @@ func TestListAllTablesByTableStatus(t *testing.T) {
 }
 
 func TestListAllTablesByShowFullTables(t *testing.T) {
-	t.Parallel()
-
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() {
@@ -239,7 +230,7 @@ func TestListAllTablesByShowFullTables(t *testing.T) {
 		expectedTbs, ok := data[d]
 		require.True(t, ok)
 
-		for i := 0; i < len(table); i++ {
+		for i := range table {
 			require.Truef(t, table[i].Equals(expectedTbs[i]), "%v mismatches expected: %v", table[i], expectedTbs[i])
 		}
 	}
@@ -266,7 +257,7 @@ func TestListAllTablesByShowFullTables(t *testing.T) {
 	require.Len(t, tables, 1)
 	require.Len(t, tables["db"], 2)
 
-	for i := 0; i < len(tables["db"]); i++ {
+	for i := range tables["db"] {
 		require.Truef(t, tables["db"][i].Equals(data["db"][i]), "%v mismatches expected: %v", tables["db"][i], data["db"][i])
 	}
 
@@ -274,8 +265,6 @@ func TestListAllTablesByShowFullTables(t *testing.T) {
 }
 
 func TestConfigValidation(t *testing.T) {
-	t.Parallel()
-
 	conf := defaultConfigForTest(t)
 	conf.Where = "id < 5"
 	conf.SQL = "select * from t where id > 3"
@@ -284,10 +273,14 @@ func TestConfigValidation(t *testing.T) {
 	conf.Where = ""
 	require.NoError(t, validateSpecifiedSQL(conf))
 
+	conf.Partitions = []string{"p1", "p2"}
+	require.EqualError(t, validateSpecifiedSQL(conf), "can't specify both --sql and --partitions at the same time")
+	conf.Partitions = nil
+
 	conf.FileType = FileFormatSQLTextString
 	err := adjustFileFormat(conf)
 	require.Error(t, err)
-	require.Regexp(t, ".*please unset --filetype or set it to 'csv'.*", err.Error())
+	require.Contains(t, err.Error(), "please unset --filetype or set it to 'csv'")
 
 	conf.FileType = FileFormatCSVString
 	require.NoError(t, adjustFileFormat(conf))
@@ -306,4 +299,36 @@ func TestConfigValidation(t *testing.T) {
 
 	conf.FileType = "rand_str"
 	require.EqualError(t, adjustFileFormat(conf), "unknown config.FileType 'rand_str'")
+}
+
+func TestValidateResolveAutoConsistency(t *testing.T) {
+	conf1 := defaultConfigForTest(t)
+	d := &Dumper{conf: conf1}
+	conf := d.conf
+
+	testCases := []struct {
+		confConsistency string
+		confSnapshot    string
+		err             bool
+	}{
+		{ConsistencyTypeAuto, "", true},
+		{ConsistencyTypeAuto, "123", false},
+		{ConsistencyTypeFlush, "", true},
+		{ConsistencyTypeFlush, "456", false},
+		{ConsistencyTypeLock, "", true},
+		{ConsistencyTypeLock, "789", false},
+		{ConsistencyTypeSnapshot, "", true},
+		{ConsistencyTypeSnapshot, "456", true},
+		{ConsistencyTypeNone, "", true},
+		{ConsistencyTypeNone, "123", false},
+	}
+	for _, testCase := range testCases {
+		conf.Consistency = testCase.confConsistency
+		conf.Snapshot = testCase.confSnapshot
+		if testCase.err {
+			require.NoError(t, validateResolveAutoConsistency(d))
+		} else {
+			require.EqualError(t, validateResolveAutoConsistency(d), fmt.Sprintf("can't specify --snapshot when --consistency isn't snapshot, resolved consistency: %s", conf.Consistency))
+		}
+	}
 }

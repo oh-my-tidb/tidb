@@ -14,7 +14,6 @@
 
 package main
 
-// #nosec G108
 import (
 	"context"
 	"flag"
@@ -27,10 +26,9 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/tidb/parser/terror"
+	"github.com/pingcap/tidb/pkg/parser/terror"
 	"github.com/tikv/client-go/v2/config"
 	"github.com/tikv/client-go/v2/rawkv"
-
 	"go.uber.org/zap"
 )
 
@@ -59,11 +57,11 @@ func batchRawPut(value []byte) {
 	wg := sync.WaitGroup{}
 	base := *dataCnt / *workerCnt
 	wg.Add(*workerCnt)
-	for i := 0; i < *workerCnt; i++ {
+	for i := range *workerCnt {
 		go func(i int) {
 			defer wg.Done()
 
-			for j := 0; j < base; j++ {
+			for j := range base {
 				k := base*i + j
 				key := fmt.Sprintf("key_%d", k)
 				err = cli.Put(ctx, []byte(key), value)

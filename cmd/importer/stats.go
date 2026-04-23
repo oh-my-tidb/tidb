@@ -22,10 +22,11 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/tidb/parser/model"
-	stats "github.com/pingcap/tidb/statistics"
-	"github.com/pingcap/tidb/statistics/handle"
-	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	stats "github.com/pingcap/tidb/pkg/statistics"
+	"github.com/pingcap/tidb/pkg/statistics/handle/storage"
+	"github.com/pingcap/tidb/pkg/statistics/util"
+	"github.com/pingcap/tidb/pkg/types"
 	"go.uber.org/zap"
 )
 
@@ -34,12 +35,12 @@ func loadStats(tblInfo *model.TableInfo, path string) (*stats.Table, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	jsTable := &handle.JSONTable{}
+	jsTable := &util.JSONTable{}
 	err = json.Unmarshal(data, jsTable)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return handle.TableStatsFromJSON(tblInfo, tblInfo.ID, jsTable)
+	return storage.TableStatsFromJSON(tblInfo, tblInfo.ID, jsTable)
 }
 
 type histogram struct {
@@ -95,13 +96,10 @@ func getValidPrefix(lower, upper string) string {
 func (h *histogram) getAvgLen(maxLen int) int {
 	l := h.Bounds.NumRows()
 	totalLen := 0
-	for i := 0; i < l; i++ {
+	for i := range l {
 		totalLen += len(h.Bounds.GetRow(i).GetString(0))
 	}
-	avg := totalLen / l
-	if avg > maxLen {
-		avg = maxLen
-	}
+	avg := min(totalLen/l, maxLen)
 	if avg == 0 {
 		avg = 1
 	}

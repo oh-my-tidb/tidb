@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/pingcap/tidb/pkg/util/promutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,15 +19,13 @@ func newSimpleRowReceiver(length int) *simpleRowReceiver {
 	return &simpleRowReceiver{data: make([]string, length)}
 }
 
-func (s *simpleRowReceiver) BindAddress(args []interface{}) {
+func (s *simpleRowReceiver) BindAddress(args []any) {
 	for i := range args {
 		args[i] = &s.data[i]
 	}
 }
 
 func TestRowIter(t *testing.T) {
-	t.Parallel()
-
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() {
@@ -42,7 +41,7 @@ func TestRowIter(t *testing.T) {
 	require.NoError(t, err)
 
 	iter := newRowIter(rows, 1)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		require.True(t, iter.HasNext())
 	}
 
@@ -66,8 +65,6 @@ func TestRowIter(t *testing.T) {
 }
 
 func TestChunkRowIter(t *testing.T) {
-	t.Parallel()
-
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() {
@@ -77,7 +74,7 @@ func TestChunkRowIter(t *testing.T) {
 	twentyBytes := strings.Repeat("x", 20)
 	thirtyBytes := strings.Repeat("x", 30)
 	expectedRows := mock.NewRows([]string{"a", "b"})
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		expectedRows.AddRow(twentyBytes, thirtyBytes)
 	}
 	mock.ExpectQuery("SELECT a, b FROM t").WillReturnRows(expectedRows)
@@ -102,7 +99,8 @@ func TestChunkRowIter(t *testing.T) {
 	sqlRowIter := newRowIter(rows, 2)
 
 	res := newSimpleRowReceiver(2)
-	wp := newWriterPipe(nil, testFileSize, testStatementSize, nil)
+	metrics := newMetrics(promutil.NewDefaultFactory(), nil)
+	wp := newWriterPipe(nil, testFileSize, testStatementSize, metrics, nil)
 
 	var resSize [][]uint64
 	for sqlRowIter.HasNext() {

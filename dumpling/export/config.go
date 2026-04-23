@@ -7,9 +7,8 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"regexp"
+	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -19,12 +18,17 @@ import (
 	"github.com/docker/go-units"
 	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
-	filter "github.com/pingcap/tidb-tools/pkg/table-filter"
-	"github.com/pingcap/tidb-tools/pkg/utils"
-	"github.com/pingcap/tidb/br/pkg/storage"
-	tcontext "github.com/pingcap/tidb/dumpling/context"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/br/pkg/version"
+	"github.com/pingcap/tidb/pkg/objstore"
+	"github.com/pingcap/tidb/pkg/objstore/compressedio"
+	"github.com/pingcap/tidb/pkg/objstore/storeapi"
+	"github.com/pingcap/tidb/pkg/util"
+	"github.com/pingcap/tidb/pkg/util/promutil"
+	filter "github.com/pingcap/tidb/pkg/util/table-filter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -46,6 +50,8 @@ const (
 	flagConsistency              = "consistency"
 	flagSnapshot                 = "snapshot"
 	flagNoViews                  = "no-views"
+	flagNoSequences              = "no-sequences"
+	flagSortByPk                 = "order-by-primary-key"
 	flagStatusAddr               = "status-addr"
 	flagRows                     = "rows"
 	flagWhere                    = "where"
@@ -65,24 +71,68 @@ const (
 	flagKey                      = "key"
 	flagCsvSeparator             = "csv-separator"
 	flagCsvDelimiter             = "csv-delimiter"
+	flagCsvLineTerminator        = "csv-line-terminator"
 	flagOutputFilenameTemplate   = "output-filename-template"
 	flagCompleteInsert           = "complete-insert"
 	flagParams                   = "params"
 	flagReadTimeout              = "read-timeout"
 	flagTransactionalConsistency = "transactional-consistency"
 	flagCompress                 = "compress"
+	flagCsvOutputDialect         = "csv-output-dialect"
+	flagPDAddr                   = "pd"
+	flagClusterSSLCA             = "cluster-ssl-ca"
+	flagClusterSSLCert           = "cluster-ssl-cert"
+	flagClusterSSLKey            = "cluster-ssl-key"
+	flagPartitions               = "partitions"
 
 	// FlagHelp represents the help flag
 	FlagHelp = "help"
 )
 
+// CSVDialect is the dialect of the CSV output for compatible with different import target
+type CSVDialect int
+
+const (
+	// CSVDialectDefault is the default dialect, which is MySQL/MariaDB/TiDB etc.
+	CSVDialectDefault CSVDialect = iota
+	// CSVDialectSnowflake is the dialect of Snowflake
+	CSVDialectSnowflake
+	// CSVDialectRedshift is the dialect of Redshift
+	CSVDialectRedshift
+	// CSVDialectBigQuery is the dialect of BigQuery
+	CSVDialectBigQuery
+)
+
+// BinaryFormat is the format of binary data
+// Three standard formats are supported: UTF8, HEX and Base64 now.
+type BinaryFormat int
+
+const (
+	// BinaryFormatUTF8 is the default format, format binary data as UTF8 string
+	BinaryFormatUTF8 BinaryFormat = iota
+	// BinaryFormatHEX format binary data as HEX string, e.g. 12ABCD
+	BinaryFormatHEX
+	// BinaryFormatBase64 format binary data as Base64 string, e.g. 123qwer==
+	BinaryFormatBase64
+)
+
+// DialectBinaryFormatMap is the map of dialect and binary format
+var DialectBinaryFormatMap = map[CSVDialect]BinaryFormat{
+	CSVDialectDefault:   BinaryFormatUTF8,
+	CSVDialectSnowflake: BinaryFormatHEX,
+	CSVDialectRedshift:  BinaryFormatHEX,
+	CSVDialectBigQuery:  BinaryFormatBase64,
+}
+
 // Config is the dump config for dumpling
 type Config struct {
-	storage.BackendOptions
+	objstore.BackendOptions
 
+	SpecifiedTables          bool
 	AllowCleartextPasswords  bool
 	SortByPk                 bool
 	NoViews                  bool
+	NoSequences              bool
 	NoHeader                 bool
 	NoSchemas                bool
 	NoData                   bool
@@ -91,7 +141,7 @@ type Config struct {
 	EscapeBackslash          bool
 	DumpEmptyDatabase        bool
 	PosAfterConnect          bool
-	CompressType             storage.CompressType
+	CompressType             compressedio.CompressType
 
 	Host     string
 	Port     int
@@ -99,77 +149,122 @@ type Config struct {
 	User     string
 	Password string `json:"-"`
 	Security struct {
+		TLS          *tls.Config `json:"-"`
 		CAPath       string
 		CertPath     string
 		KeyPath      string
 		SSLCABytes   []byte `json:"-"`
 		SSLCertBytes []byte `json:"-"`
-		SSLKEYBytes  []byte `json:"-"`
+		SSLKeyBytes  []byte `json:"-"`
 	}
 
-	LogLevel      string
-	LogFile       string
-	LogFormat     string
-	OutputDirPath string
-	StatusAddr    string
-	Snapshot      string
-	Consistency   string
-	CsvNullValue  string
-	SQL           string
-	CsvSeparator  string
-	CsvDelimiter  string
-	Databases     []string
+	LogLevel          string
+	LogFile           string
+	LogFormat         string
+	OutputDirPath     string
+	StatusAddr        string
+	Snapshot          string
+	Consistency       string
+	CsvNullValue      string
+	SQL               string
+	CsvSeparator      string
+	CsvDelimiter      string
+	CsvLineTerminator string
+	Databases         []string
 
-	TableFilter        filter.Filter `json:"-"`
-	Where              string
-	FileType           string
-	ServerInfo         ServerInfo
-	Logger             *zap.Logger        `json:"-"`
-	OutputFileTemplate *template.Template `json:"-"`
-	Rows               uint64
-	ReadTimeout        time.Duration
-	TiDBMemQuotaQuery  uint64
-	FileSize           uint64
-	StatementSize      uint64
-	SessionParams      map[string]interface{}
-	Labels             prometheus.Labels `json:"-"`
-	Tables             DatabaseTables
+	TableFilter         filter.Filter `json:"-"`
+	Where               string
+	FileType            string
+	ServerInfo          version.ServerInfo
+	Logger              *zap.Logger        `json:"-"`
+	OutputFileTemplate  *template.Template `json:"-"`
+	Rows                uint64
+	ReadTimeout         time.Duration
+	TiDBMemQuotaQuery   uint64
+	FileSize            uint64
+	StatementSize       uint64
+	SessionParams       map[string]any
+	Tables              DatabaseTables
+	CollationCompatible string
+	CsvOutputDialect    CSVDialect
+	Partitions          []string
+
+	Labels        prometheus.Labels `json:"-"`
+	PromFactory   promutil.Factory  `json:"-"`
+	PromRegistry  promutil.Registry `json:"-"`
+	ExtStorage    storeapi.Storage  `json:"-"`
+	MinTLSVersion uint16            `json:"-"`
+
+	IOTotalBytes *atomic.Uint64
+	Net          string
+
+	// PDAddr is a comma-separated list of PD endpoints in host:port form.
+	// http:// or https:// prefixes are also accepted and normalized by the PD client.
+	// It's used for controlling GC in keyspace-level clusters where PD addresses
+	// may not be discoverable from TiDB.
+	PDAddr string
+	// ClusterSSLCA/ClusterSSLCert/ClusterSSLKey override Security.* when connecting
+	// to PD endpoints for GC control.
+	ClusterSSLCA   string
+	ClusterSSLCert string
+	ClusterSSLKey  string
+}
+
+// ServerInfoUnknown is the unknown database type to dumpling
+var ServerInfoUnknown = version.ServerInfo{
+	ServerType:    version.ServerTypeUnknown,
+	ServerVersion: nil,
 }
 
 // DefaultConfig returns the default export Config for dumpling
 func DefaultConfig() *Config {
 	allFilter, _ := filter.Parse([]string{"*.*"})
 	return &Config{
-		Databases:          nil,
-		Host:               "127.0.0.1",
-		User:               "root",
-		Port:               3306,
-		Password:           "",
-		Threads:            4,
-		Logger:             nil,
-		StatusAddr:         ":8281",
-		FileSize:           UnspecifiedSize,
-		StatementSize:      DefaultStatementSize,
-		OutputDirPath:      ".",
-		ServerInfo:         ServerInfoUnknown,
-		SortByPk:           true,
-		Tables:             nil,
-		Snapshot:           "",
-		Consistency:        consistencyTypeAuto,
-		NoViews:            true,
-		Rows:               UnspecifiedSize,
-		Where:              "",
-		FileType:           "",
-		NoHeader:           false,
-		NoSchemas:          false,
-		NoData:             false,
-		CsvNullValue:       "\\N",
-		SQL:                "",
-		TableFilter:        allFilter,
-		DumpEmptyDatabase:  true,
-		SessionParams:      make(map[string]interface{}),
-		OutputFileTemplate: DefaultOutputFileTemplate,
-		PosAfterConnect:    false,
+		Databases:                nil,
+		Host:                     "127.0.0.1",
+		User:                     "root",
+		Port:                     3306,
+		Password:                 "",
+		Threads:                  4,
+		Logger:                   nil,
+		StatusAddr:               ":8281",
+		FileSize:                 UnspecifiedSize,
+		StatementSize:            DefaultStatementSize,
+		OutputDirPath:            ".",
+		ServerInfo:               ServerInfoUnknown,
+		SortByPk:                 true,
+		Tables:                   nil,
+		Snapshot:                 "",
+		Consistency:              ConsistencyTypeAuto,
+		NoViews:                  true,
+		NoSequences:              true,
+		Rows:                     UnspecifiedSize,
+		Where:                    "",
+		EscapeBackslash:          true,
+		FileType:                 "",
+		NoHeader:                 false,
+		NoSchemas:                false,
+		NoData:                   false,
+		CsvNullValue:             "\\N",
+		SQL:                      "",
+		TableFilter:              allFilter,
+		DumpEmptyDatabase:        true,
+		CsvDelimiter:             "\"",
+		CsvSeparator:             ",",
+		CsvLineTerminator:        "\r\n",
+		SessionParams:            make(map[string]any),
+		OutputFileTemplate:       DefaultOutputFileTemplate,
+		PosAfterConnect:          false,
+		CollationCompatible:      LooseCollationCompatible,
+		CsvOutputDialect:         CSVDialectDefault,
+		SpecifiedTables:          false,
+		PromFactory:              promutil.NewDefaultFactory(),
+		PromRegistry:             promutil.NewDefaultRegistry(),
+		TransactionalConsistency: true,
+		PDAddr:                   "",
+		ClusterSSLCA:             "",
+		ClusterSSLCert:           "",
+		ClusterSSLKey:            "",
 	}
 }
 
@@ -182,19 +277,50 @@ func (conf *Config) String() string {
 	return string(cfg)
 }
 
-// GetDSN generates DSN from Config
-func (conf *Config) GetDSN(db string) string {
+// GetDriverConfig returns the MySQL driver config from Config.
+func (conf *Config) GetDriverConfig(db string) *mysql.Config {
+	driverCfg := mysql.NewConfig()
 	// maxAllowedPacket=0 can be used to automatically fetch the max_allowed_packet variable from server on every connection.
 	// https://github.com/go-sql-driver/mysql#maxallowedpacket
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?collation=utf8mb4_general_ci&readTimeout=%s&writeTimeout=30s&interpolateParams=true&maxAllowedPacket=0",
-		conf.User, conf.Password, conf.Host, conf.Port, db, conf.ReadTimeout)
-	if len(conf.Security.CAPath) > 0 {
-		dsn += "&tls=dumpling-tls-target"
+	hostPort := net.JoinHostPort(conf.Host, strconv.Itoa(conf.Port))
+	driverCfg.User = conf.User
+	driverCfg.Passwd = conf.Password
+	driverCfg.Net = "tcp"
+	if conf.Net != "" {
+		driverCfg.Net = conf.Net
+	}
+	driverCfg.Addr = hostPort
+	driverCfg.DBName = db
+	driverCfg.Collation = "utf8mb4_general_ci"
+	driverCfg.ReadTimeout = conf.ReadTimeout
+	driverCfg.WriteTimeout = 30 * time.Second
+	driverCfg.InterpolateParams = true
+	driverCfg.MaxAllowedPacket = 0
+	if conf.Security.TLS != nil {
+		driverCfg.TLS = conf.Security.TLS
+	} else {
+		// Use TLS first.
+		driverCfg.AllowFallbackToPlaintext = true
+		minTLSVersion := uint16(tls.VersionTLS12)
+		if conf.MinTLSVersion != 0 {
+			minTLSVersion = conf.MinTLSVersion
+		}
+		/* #nosec G402 */
+		driverCfg.TLS = &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         minTLSVersion,
+			NextProtos:         []string{"h2", "http/1.1"}, // specify `h2` to let Go use HTTP/2.
+		}
 	}
 	if conf.AllowCleartextPasswords {
-		dsn += "&allowCleartextPasswords=1"
+		driverCfg.AllowCleartextPasswords = true
 	}
-	return dsn
+	failpoint.Inject("SetWaitTimeout", func(val failpoint.Value) {
+		driverCfg.Params = map[string]string{
+			"wait_timeout": strconv.Itoa(val.(int)),
+		}
+	})
+	return driverCfg
 }
 
 func timestampDirName() string {
@@ -202,8 +328,8 @@ func timestampDirName() string {
 }
 
 // DefineFlags defines flags of dumpling's configuration
-func (conf *Config) DefineFlags(flags *pflag.FlagSet) {
-	storage.DefineFlags(flags)
+func (*Config) DefineFlags(flags *pflag.FlagSet) {
+	objstore.DefineFlags(flags)
 	flags.StringSliceP(flagDatabase, "B", nil, "Databases to dump")
 	flags.StringSliceP(flagTablesList, "T", nil, "Comma delimited table list to dump; must be qualified table names")
 	flags.StringP(flagHost, "h", "127.0.0.1", "The host to connect to")
@@ -218,9 +344,11 @@ func (conf *Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.String(flagLoglevel, "info", "Log level: {debug|info|warn|error|dpanic|panic|fatal}")
 	flags.StringP(flagLogfile, "L", "", "Log file `path`, leave empty to write to console")
 	flags.String(flagLogfmt, "text", "Log `format`: {text|json}")
-	flags.String(flagConsistency, consistencyTypeAuto, "Consistency level during dumping: {auto|none|flush|lock|snapshot}")
+	flags.String(flagConsistency, ConsistencyTypeAuto, "Consistency level during dumping: {auto|none|flush|lock|snapshot}")
 	flags.String(flagSnapshot, "", "Snapshot position (uint64 or MySQL style string timestamp). Valid only when consistency=snapshot")
 	flags.BoolP(flagNoViews, "W", true, "Do not dump views")
+	flags.Bool(flagNoSequences, true, "Do not dump sequences")
+	flags.Bool(flagSortByPk, true, "Sort dump results by primary key through order by sql")
 	flags.String(flagStatusAddr, ":8281", "dumpling API server and pprof addr")
 	flags.Uint64P(flagRows, "r", UnspecifiedSize, "If specified, dumpling will split table into chunks and concurrently dump them to different files to improve efficiency. For TiDB v3.0+, specify this will make dumpling split table with each file one TiDB region(no matter how many rows is).\n"+
 		"If not specified, dumpling will dump table without inner-concurrency which could be relatively slow. default unlimited")
@@ -242,6 +370,7 @@ func (conf *Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.String(flagKey, "", "The path name to the client private key file for TLS connection")
 	flags.String(flagCsvSeparator, ",", "The separator for csv files, default ','")
 	flags.String(flagCsvDelimiter, "\"", "The delimiter for values in csv files, default '\"'")
+	flags.String(flagCsvLineTerminator, "\r\n", "The line terminator for csv files, default '\\r\\n'")
 	flags.String(flagOutputFilenameTemplate, "", "The output filename template (without file extension)")
 	flags.Bool(flagCompleteInsert, false, "Use complete INSERT statements that include column names")
 	flags.StringToString(flagParams, nil, `Extra session variables used while dumping, accepted format: --params "character_set_client=latin1,character_set_connection=latin1"`)
@@ -250,7 +379,14 @@ func (conf *Config) DefineFlags(flags *pflag.FlagSet) {
 	_ = flags.MarkHidden(flagReadTimeout)
 	flags.Bool(flagTransactionalConsistency, true, "Only support transactional consistency")
 	_ = flags.MarkHidden(flagTransactionalConsistency)
-	flags.StringP(flagCompress, "c", "", "Compress output file type, support 'gzip', 'no-compression' now")
+	flags.StringP(flagCompress, "c", "", "Compress output file type, support 'gzip', 'snappy', 'zstd', 'no-compression' now")
+	flags.String(flagCsvOutputDialect, "", "The dialect of output CSV file, support 'snowflake', 'redshift', 'bigquery' now")
+	flags.StringSlice(flagPartitions, nil, "The table partitions to dump. Every listed partition must exist on all selected base tables; incompatible with --sql. TiDB >= v5.0.0 only")
+
+	flags.String(flagPDAddr, "", "PD endpoints for controlling GC in premium keyspace clusters (comma-separated host:port list; http(s):// is also accepted and normalized)")
+	flags.String(flagClusterSSLCA, "", "CA certificate path for TLS connections to PD endpoints used by GC control; if empty, reuse --ca")
+	flags.String(flagClusterSSLCert, "", "Client certificate path for TLS connections to PD endpoints used by GC control; if empty, reuse --cert")
+	flags.String(flagClusterSSLKey, "", "Client private key path for TLS connections to PD endpoints used by GC control; if empty, reuse --key")
 }
 
 // ParseFromFlags parses dumpling's export.Config from flags
@@ -314,6 +450,14 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 	conf.NoViews, err = flags.GetBool(flagNoViews)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.NoSequences, err = flags.GetBool(flagNoSequences)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.SortByPk, err = flags.GetBool(flagSortByPk)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -381,6 +525,10 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
+	conf.CsvLineTerminator, err = flags.GetString(flagCsvLineTerminator)
+	if err != nil {
+		return errors.Trace(err)
+	}
 	conf.CompleteInsert, err = flags.GetBool(flagCompleteInsert)
 	if err != nil {
 		return errors.Trace(err)
@@ -397,6 +545,11 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
+	conf.Partitions, err = flags.GetStringSlice(flagPartitions)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.Partitions = normalizePartitions(conf.Partitions)
 
 	if conf.Threads <= 0 {
 		return errors.Errorf("--threads is set to %d. It should be greater than 0", conf.Threads)
@@ -406,7 +559,7 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	}
 
 	if conf.SessionParams == nil {
-		conf.SessionParams = make(map[string]interface{})
+		conf.SessionParams = make(map[string]any)
 	}
 
 	tablesList, err := flags.GetStringSlice(flagTablesList)
@@ -434,6 +587,12 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 
+	conf.SpecifiedTables = len(tablesList) > 0
+	conf.Tables, err = GetConfTables(tablesList)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
 	conf.TableFilter, err = ParseTableFilter(tablesList, filters)
 	if err != nil {
 		return errors.Errorf("failed to parse filter: %s", err)
@@ -453,7 +612,7 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	}
 	tmpl, err := ParseOutputFileTemplate(outputFilenameFormat)
 	if err != nil {
-		return errors.Errorf("failed to parse output filename template (--output-filename-template '%s')\n", outputFilenameFormat)
+		return errors.Errorf("failed to parse output filename template (--output-filename-template '%s')", outputFilenameFormat)
 	}
 	conf.OutputFileTemplate = tmpl
 
@@ -461,7 +620,36 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	conf.CompressType, err = ParseCompressType(compressType)
+	conf.CompressType, err = compressedio.ParseCompressType(compressType)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	dialect, err := flags.GetString(flagCsvOutputDialect)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if dialect != "" && conf.FileType != "csv" {
+		return errors.Errorf("%s is only supported when dumping whole table to csv, not compatible with %s", flagCsvOutputDialect, conf.FileType)
+	}
+	conf.CsvOutputDialect, err = ParseOutputDialect(dialect)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	conf.PDAddr, err = flags.GetString(flagPDAddr)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.ClusterSSLCA, err = flags.GetString(flagClusterSSLCA)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.ClusterSSLCert, err = flags.GetString(flagClusterSSLCert)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.ClusterSSLKey, err = flags.GetString(flagClusterSSLKey)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -498,7 +686,7 @@ func ParseTableFilter(tablesList, filters []string) (filter.Filter, error) {
 	}
 
 	// only parse -T when -f is default value. otherwise bail out.
-	if !sameStringArray(filters, []string{"*.*", DefaultTableFilter}) {
+	if !slices.Equal(filters, []string{"*.*", DefaultTableFilter}) {
 		return nil, errors.New("cannot pass --tables-list and --filter together")
 	}
 
@@ -514,38 +702,53 @@ func ParseTableFilter(tablesList, filters []string) (filter.Filter, error) {
 	return filter.NewTablesFilter(tableNames...), nil
 }
 
-// ParseCompressType parses compressType string to storage.CompressType
-func ParseCompressType(compressType string) (storage.CompressType, error) {
-	switch compressType {
-	case "", "no-compression":
-		return storage.NoCompression, nil
-	case "gzip", "gz":
-		return storage.Gzip, nil
+// GetConfTables parses tables from tables-list and filter arguments
+func GetConfTables(tablesList []string) (DatabaseTables, error) {
+	dbTables := DatabaseTables{}
+	var (
+		tablename    string
+		avgRowLength uint64
+	)
+	avgRowLength = 0
+	for _, tablename = range tablesList {
+		parts := strings.SplitN(tablename, ".", 2)
+		if len(parts) < 2 {
+			return nil, errors.Errorf("--tables-list only accepts qualified table names, but `%s` lacks a dot", tablename)
+		}
+		dbName := parts[0]
+		tbName := parts[1]
+		dbTables[dbName] = append(dbTables[dbName], &TableInfo{tbName, avgRowLength, TableTypeBase})
+	}
+	return dbTables, nil
+}
+
+// ParseOutputDialect parses output dialect string to Dialect
+func ParseOutputDialect(outputDialect string) (CSVDialect, error) {
+	switch outputDialect {
+	case "", "default":
+		return CSVDialectDefault, nil
+	case "snowflake":
+		return CSVDialectSnowflake, nil
+	case "redshift":
+		return CSVDialectRedshift, nil
+	case "bigquery":
+		return CSVDialectBigQuery, nil
 	default:
-		return storage.NoCompression, errors.Errorf("unknown compress type %s", compressType)
+		return CSVDialectDefault, errors.Errorf("unknown output dialect %s", outputDialect)
 	}
 }
 
-func (conf *Config) createExternalStorage(ctx context.Context) (storage.ExternalStorage, error) {
-	b, err := storage.ParseBackend(conf.OutputDirPath, &conf.BackendOptions)
+func (conf *Config) createExternalStorage(ctx context.Context) (storeapi.Storage, error) {
+	if conf.ExtStorage != nil {
+		return conf.ExtStorage, nil
+	}
+	b, err := objstore.ParseBackend(conf.OutputDirPath, &conf.BackendOptions)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	httpClient := http.DefaultClient
-	httpClient.Timeout = 30 * time.Second
-	maxIdleConnsPerHost := http.DefaultMaxIdleConnsPerHost
-	if conf.Threads > maxIdleConnsPerHost {
-		maxIdleConnsPerHost = conf.Threads
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConnsPerHost = maxIdleConnsPerHost
-	httpClient.Transport = transport
 
-	return storage.New(ctx, b, &storage.ExternalStorageOptions{
-		HTTPClient:      httpClient,
-		SkipCheckPath:   true,
-		SendCredentials: false,
-	})
+	// TODO: support setting httpClient with certification later
+	return objstore.New(ctx, b, &storeapi.Options{})
 }
 
 const (
@@ -558,108 +761,24 @@ const (
 	// DefaultTableFilter is the default exclude table filter. It will exclude all system databases
 	DefaultTableFilter = "!/^(mysql|sys|INFORMATION_SCHEMA|PERFORMANCE_SCHEMA|METRICS_SCHEMA|INSPECTION_SCHEMA)$/.*"
 
-	defaultDumpThreads        = 128
-	defaultDumpGCSafePointTTL = 5 * 60
-	defaultEtcdDialTimeOut    = 3 * time.Second
+	defaultTaskChannelCapacity = 128
+	defaultDumpGCSafePointTTL  = 5 * 60
+	defaultEtcdDialTimeOut     = 3 * time.Second
+
+	// LooseCollationCompatible is used in DM, represents a collation setting for best compatibility.
+	LooseCollationCompatible = "loose"
+	// StrictCollationCompatible is used in DM, represents a collation setting for correctness.
+	StrictCollationCompatible = "strict"
 
 	dumplingServiceSafePointPrefix = "dumpling"
 )
 
 var (
-	decodeRegionVersion = semver.New("3.0.0")
-	gcSafePointVersion  = semver.New("4.0.0")
-	tableSampleVersion  = semver.New("5.0.0-nightly")
+	decodeRegionVersion    = semver.New("3.0.0")
+	gcSafePointVersion     = semver.New("4.0.0")
+	tableSampleVersion     = semver.New("5.0.0-nightly")
+	minNewTerminologyMySQL = semver.New("8.4.0") // first MySQL version to no longer support MASTER/SLAVE/etc
 )
-
-// ServerInfo is the combination of ServerType and ServerInfo
-type ServerInfo struct {
-	HasTiKV       bool
-	ServerType    ServerType
-	ServerVersion *semver.Version
-}
-
-// ServerInfoUnknown is the unknown database type to dumpling
-var ServerInfoUnknown = ServerInfo{
-	ServerType:    ServerTypeUnknown,
-	ServerVersion: nil,
-}
-
-var (
-	versionRegex     = regexp.MustCompile(`^\d+\.\d+\.\d+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?`)
-	tidbVersionRegex = regexp.MustCompile(`-[v]?\d+\.\d+\.\d+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?`)
-)
-
-// ParseServerInfo parses exported server type and version info from version string
-func ParseServerInfo(tctx *tcontext.Context, src string) ServerInfo {
-	tctx.L().Debug("parse server info", zap.String("server info string", src))
-	lowerCase := strings.ToLower(src)
-	serverInfo := ServerInfo{}
-	switch {
-	case strings.Contains(lowerCase, "tidb"):
-		serverInfo.ServerType = ServerTypeTiDB
-	case strings.Contains(lowerCase, "mariadb"):
-		serverInfo.ServerType = ServerTypeMariaDB
-	case versionRegex.MatchString(lowerCase):
-		serverInfo.ServerType = ServerTypeMySQL
-	default:
-		serverInfo.ServerType = ServerTypeUnknown
-	}
-
-	tctx.L().Info("detect server type",
-		zap.String("type", serverInfo.ServerType.String()))
-
-	var versionStr string
-	if serverInfo.ServerType == ServerTypeTiDB {
-		versionStr = tidbVersionRegex.FindString(src)[1:]
-		versionStr = strings.TrimPrefix(versionStr, "v")
-	} else {
-		versionStr = versionRegex.FindString(src)
-	}
-
-	var err error
-	serverInfo.ServerVersion, err = semver.NewVersion(versionStr)
-	if err != nil {
-		tctx.L().Warn("fail to parse version",
-			zap.String("version", versionStr))
-		return serverInfo
-	}
-
-	tctx.L().Info("detect server version",
-		zap.String("version", serverInfo.ServerVersion.String()))
-	return serverInfo
-}
-
-// ServerType represents the type of database to export
-type ServerType int8
-
-// String implements Stringer.String
-func (s ServerType) String() string {
-	if s >= ServerTypeAll {
-		return ""
-	}
-	return serverTypeString[s]
-}
-
-const (
-	// ServerTypeUnknown represents unknown server type
-	ServerTypeUnknown = iota
-	// ServerTypeMySQL represents MySQL server type
-	ServerTypeMySQL
-	// ServerTypeMariaDB represents MariaDB server type
-	ServerTypeMariaDB
-	// ServerTypeTiDB represents TiDB server type
-	ServerTypeTiDB
-
-	// ServerTypeAll represents All server types
-	ServerTypeAll
-)
-
-var serverTypeString = []string{
-	ServerTypeUnknown: "Unknown",
-	ServerTypeMySQL:   "MySQL",
-	ServerTypeMariaDB: "MariaDB",
-	ServerTypeTiDB:    "TiDB",
-}
 
 func adjustConfig(conf *Config, fns ...func(*Config) error) error {
 	for _, f := range fns {
@@ -671,45 +790,27 @@ func adjustConfig(conf *Config, fns ...func(*Config) error) error {
 	return nil
 }
 
-func registerTLSConfig(conf *Config) error {
-	if len(conf.Security.CAPath) > 0 {
-		var err error
-		var tlsConfig *tls.Config
-		if len(conf.Security.SSLCABytes) == 0 {
-			conf.Security.SSLCABytes, err = ioutil.ReadFile(conf.Security.CAPath)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			conf.Security.SSLCertBytes, err = ioutil.ReadFile(conf.Security.CertPath)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			conf.Security.SSLKEYBytes, err = ioutil.ReadFile(conf.Security.KeyPath)
-			if err != nil {
-				return errors.Trace(err)
-			}
-		}
-		tlsConfig, err = utils.ToTLSConfigWithVerifyByRawbytes(conf.Security.SSLCABytes,
-			conf.Security.SSLCertBytes, conf.Security.SSLKEYBytes, []string{})
-		if err != nil {
-			return errors.Trace(err)
-		}
-		// NOTE for local test(use a self-signed or invalid certificate), we don't need to check CA file.
-		// see more here https://github.com/go-sql-driver/mysql#tls
-		if conf.Host == "127.0.0.1" {
-			tlsConfig.InsecureSkipVerify = true
-		}
-		err = mysql.RegisterTLSConfig("dumpling-tls-target", tlsConfig)
-		if err != nil {
-			return errors.Trace(err)
-		}
+func buildTLSConfig(conf *Config) error {
+	tlsConfig, err := util.NewTLSConfig(
+		util.WithCAPath(conf.Security.CAPath),
+		util.WithCertAndKeyPath(conf.Security.CertPath, conf.Security.KeyPath),
+		util.WithCAContent(conf.Security.SSLCABytes),
+		util.WithCertAndKeyContent(conf.Security.SSLCertBytes, conf.Security.SSLKeyBytes),
+		util.WithMinTLSVersion(conf.MinTLSVersion),
+	)
+	if err != nil {
+		return errors.Trace(err)
 	}
+	conf.Security.TLS = tlsConfig
 	return nil
 }
 
 func validateSpecifiedSQL(conf *Config) error {
 	if conf.SQL != "" && conf.Where != "" {
 		return errors.New("can't specify both --sql and --where at the same time. Please try to combine them into --sql")
+	}
+	if conf.SQL != "" && len(conf.Partitions) > 0 {
+		return errors.New("can't specify both --sql and --partitions at the same time")
 	}
 	return nil
 }
@@ -734,15 +835,32 @@ func adjustFileFormat(conf *Config) error {
 	return nil
 }
 
-func matchMysqlBugversion(info ServerInfo) bool {
+func matchMysqlBugversion(info version.ServerInfo) bool {
 	// if 8.0.3 <= mysql8 version < 8.0.23
 	// FLUSH TABLES WITH READ LOCK could block other sessions from executing SHOW TABLE STATUS.
 	// see more in https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-23.html
-	if info.ServerType != ServerTypeMySQL {
+	if info.ServerType != version.ServerTypeMySQL {
 		return false
 	}
 	currentVersion := info.ServerVersion
 	bugVersionStart := semver.New("8.0.2")
 	bugVersionEnd := semver.New("8.0.23")
 	return bugVersionStart.LessThan(*currentVersion) && currentVersion.LessThan(*bugVersionEnd)
+}
+
+func normalizePartitions(partitions []string) []string {
+	seen := make(map[string]struct{}, len(partitions))
+	result := make([]string, 0, len(partitions))
+	for _, p := range partitions {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		result = append(result, p)
+	}
+	return result
 }

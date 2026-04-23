@@ -1,4 +1,5 @@
-// +build linux darwin freebsd unix
+//go:build linux || darwin || freebsd || unix
+
 // Copyright 2020 PingCAP, Inc. Licensed under Apache-2.0.
 
 package utils
@@ -9,7 +10,7 @@ import (
 	"syscall"
 
 	"github.com/pingcap/log"
-	tidbutils "github.com/pingcap/tidb-tools/pkg/utils"
+	tidbutils "github.com/pingcap/tidb/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -23,7 +24,7 @@ func StartDynamicPProfListener(tls *tidbutils.TLS) {
 		for sig := range signalChan {
 			if sig == startPProfSignal {
 				log.Info("signal received, starting pprof...", zap.Stringer("signal", sig))
-				if err := StartPProfListener("0.0.0.0:0", tls); err != nil {
+				if err := StartStatusListener("0.0.0.0:0", tls); err != nil {
 					log.Warn("failed to start pprof", zap.Error(err))
 					return
 				}

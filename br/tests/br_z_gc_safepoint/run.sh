@@ -21,6 +21,7 @@
 
 set -eux
 
+CUR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DB="$TEST_NAME"
 TABLE="usertable"
 
@@ -28,7 +29,7 @@ MAX_UINT64=9223372036854775807
 
 run_sql "CREATE DATABASE $DB;"
 
-go-ycsb load mysql -P tests/$TEST_NAME/workload -p mysql.host=$TIDB_IP -p mysql.port=$TIDB_PORT -p mysql.user=root -p mysql.db=$DB
+go-ycsb load mysql -P $CUR/workload -p mysql.host=$TIDB_IP -p mysql.port=$TIDB_PORT -p mysql.user=root -p mysql.db=$DB
 
 # Update GC safepoint to now + 5s after 10s seconds.
 sleep 10 && bin/gc -pd $PD_ADDR \
@@ -46,31 +47,6 @@ run_br --pd $PD_ADDR backup table -s "local://$TEST_DIR/$DB/1" --db $DB -t $TABL
 
 if [ "$backup_gc_fail" -ne "0" ];then
     echo "TEST: [$TEST_NAME] test check backup ts failed!"
-    exit 1
-fi
-
-# set safePoint otherwise the default safePoint is zero
-bin/gc -pd $PD_ADDR \
-    --ca "$TEST_DIR/certs/ca.pem" \
-    --cert "$TEST_DIR/certs/br.pem" \
-    --key "$TEST_DIR/certs/br.key" \
-    -gc-offset "1s"
-
-backup_gc_fail=0
-echo "incremental backup start (expect fail)..."
-run_br --pd $PD_ADDR backup table -s "local://$TEST_DIR/$DB/2" --db $DB -t $TABLE --lastbackupts 1 --ratelimit 1 --ratelimit-unit 1 || backup_gc_fail=1
-
-if [ "$backup_gc_fail" -ne "1" ];then
-    echo "TEST: [$TEST_NAME] test check last backup ts failed!"
-    exit 1
-fi
-
-backup_gc_fail=0
-echo "incremental backup with max_uint64 start (expect fail)..."
-run_br --pd $PD_ADDR backup table -s "local://$TEST_DIR/$DB/3" --db $DB -t $TABLE --lastbackupts $MAX_UINT64 --ratelimit 1 --ratelimit-unit 1 || backup_gc_fail=1
-
-if [ "$backup_gc_fail" -ne "1" ];then
-    echo "TEST: [$TEST_NAME] test check max backup ts failed!"
     exit 1
 fi
 

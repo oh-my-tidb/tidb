@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tidb/br/pkg/storage"
+	"github.com/pingcap/tidb/br/pkg/version"
 	tcontext "github.com/pingcap/tidb/dumpling/context"
+	"github.com/pingcap/tidb/pkg/objstore/compressedio"
+	"github.com/pingcap/tidb/pkg/objstore/storeapi"
 	"go.uber.org/zap"
 )
 
@@ -22,19 +24,19 @@ type globalMetadata struct {
 	afterConnBuffer bytes.Buffer
 	snapshot        string
 
-	storage storage.ExternalStorage
+	storage storeapi.Storage
 }
 
 const (
 	metadataPath       = "metadata"
-	metadataTimeLayout = "2006-01-02 15:04:05"
+	metadataTimeLayout = time.DateTime
 
 	fileFieldIndex    = 0
 	posFieldIndex     = 1
 	gtidSetFieldIndex = 4
 )
 
-func newGlobalMetadata(tctx *tcontext.Context, s storage.ExternalStorage, snapshot string) *globalMetadata {
+func newGlobalMetadata(tctx *tcontext.Context, s storeapi.Storage, snapshot string) *globalMetadata {
 	return &globalMetadata{
 		tctx:     tctx,
 		storage:  s,
@@ -56,15 +58,16 @@ func (m *globalMetadata) recordFinishTime(t time.Time) {
 	m.buffer.WriteString("Finished dump at: " + t.Format(metadataTimeLayout) + "\n")
 }
 
-func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverType ServerType, afterConn bool) error { // revive:disable-line:flag-parameter
+func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverInfo version.ServerInfo, afterConn bool) error { // revive:disable-line:flag-parameter
 	if afterConn {
 		m.afterConnBuffer.Reset()
-		return recordGlobalMetaData(m.tctx, db, &m.afterConnBuffer, serverType, afterConn, m.snapshot)
+		return recordGlobalMetaData(m.tctx, db, &m.afterConnBuffer, serverInfo, afterConn, m.snapshot)
 	}
-	return recordGlobalMetaData(m.tctx, db, &m.buffer, serverType, afterConn, m.snapshot)
+	return recordGlobalMetaData(m.tctx, db, &m.buffer, serverInfo, afterConn, m.snapshot)
 }
 
-func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Buffer, serverType ServerType, afterConn bool, snapshot string) error { // revive:disable-line:flag-parameter
+func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Buffer, serverInfo version.ServerInfo, afterConn bool, snapshot string) error { // revive:disable-line:flag-parameter
+	serverType := serverInfo.ServerType
 	writeMasterStatusHeader := func() {
 		buffer.WriteString("SHOW MASTER STATUS:")
 		if afterConn {
@@ -93,14 +96,14 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 	// | tidb-binlog | 415195906970746880 |              |                  |                   |
 	// +-------------+--------------------+--------------+------------------+-------------------+
 	// 1 row in set (0.00 sec)
-	case ServerTypeMySQL, ServerTypeTiDB:
-		str, err := ShowMasterStatus(db)
+	case version.ServerTypeMySQL, version.ServerTypeTiDB:
+		str, err := ShowMasterStatus(db, serverInfo)
 		if err != nil {
 			return err
 		}
 		logFile := getValidStr(str, fileFieldIndex)
 		var pos string
-		if serverType == ServerTypeTiDB && snapshot != "" {
+		if serverType == version.ServerTypeTiDB && snapshot != "" {
 			pos = snapshot
 		} else {
 			pos = getValidStr(str, posFieldIndex)
@@ -125,8 +128,8 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 	// | 0-1-2                    |
 	// +--------------------------+
 	// 1 row in set (0.00 sec)
-	case ServerTypeMariaDB:
-		str, err := ShowMasterStatus(db)
+	case version.ServerTypeMariaDB:
+		str, err := ShowMasterStatus(db, serverInfo)
 		if err != nil {
 			return err
 		}
@@ -135,7 +138,7 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 		var gtidSet string
 		err = db.QueryRowContext(context.Background(), "SELECT @@global.gtid_binlog_pos").Scan(&gtidSet)
 		if err != nil {
-			tctx.L().Error("fail to get gtid for mariaDB", zap.Error(err))
+			tctx.L().Warn("fail to get gtid for MariaDB", zap.Error(err))
 		}
 
 		if logFile != "" {
@@ -146,7 +149,7 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 		return errors.Errorf("unsupported serverType %s for recordGlobalMetaData", serverType.String())
 	}
 	buffer.WriteString("\n")
-	if serverType == ServerTypeTiDB {
+	if serverType == version.ServerTypeTiDB {
 		return nil
 	}
 
@@ -159,16 +162,21 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 		isms  bool
 		query string
 	)
-	if err := simpleQuery(db, "SELECT @@default_master_connection", func(rows *sql.Rows) error {
+	if err := simpleQuery(db, "SELECT @@default_master_connection", func(*sql.Rows) error {
 		isms = true
 		return nil
 	}); err != nil {
 		isms = false
 	}
 	if isms {
-		query = "SHOW ALL SLAVES STATUS"
+		query = "SHOW ALL SLAVES STATUS" // MariaDB
+	} else if serverInfo.ServerVersion == nil {
+		query = "SHOW SLAVE STATUS" // Unknown version
+	} else if serverInfo.ServerType == version.ServerTypeMySQL &&
+		!serverInfo.ServerVersion.LessThan(*minNewTerminologyMySQL) {
+		query = "SHOW REPLICA STATUS" // MySQL 8.4.0 and newer
 	} else {
-		query = "SHOW SLAVE STATUS"
+		query = "SHOW SLAVE STATUS" // MySQL
 	}
 	return simpleQuery(db, query, func(rows *sql.Rows) error {
 		cols, err := rows.Columns()
@@ -176,7 +184,7 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 			return errors.Trace(err)
 		}
 		data := make([]sql.NullString, len(cols))
-		args := make([]interface{}, 0, len(cols))
+		args := make([]any, 0, len(cols))
 		for i := range data {
 			args = append(args, &data[i])
 		}
@@ -190,13 +198,14 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 				switch col {
 				case "connection_name":
 					connName = data[i].String
-				case "exec_master_log_pos":
+				case "exec_master_log_pos", "exec_source_log_pos":
 					pos = data[i].String
-				case "relay_master_log_file":
+				case "relay_master_log_file", "relay_source_log_file":
 					logFile = data[i].String
-				case "master_host":
+				case "master_host", "source_host":
 					host = data[i].String
-				case "executed_gtid_set":
+				case "executed_gtid_set", // MySQL
+					"gtid_io_pos": // MariaDB
 					gtidSet = data[i].String
 				}
 			}
@@ -214,13 +223,16 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 
 func (m *globalMetadata) writeGlobalMetaData() error {
 	// keep consistent with mydumper. Never compress metadata
-	fileWriter, tearDown, err := buildFileWriter(m.tctx, m.storage, metadataPath, storage.NoCompression)
+	fileWriter, tearDown, err := buildFileWriter(m.tctx, m.storage, metadataPath, compressedio.NoCompression)
 	if err != nil {
 		return err
 	}
-	defer tearDown(m.tctx)
-
-	return write(m.tctx, fileWriter, m.String())
+	err = write(m.tctx, fileWriter, m.String())
+	tearDownErr := tearDown(m.tctx)
+	if err == nil {
+		return tearDownErr
+	}
+	return err
 }
 
 func getValidStr(str []string, idx int) string {

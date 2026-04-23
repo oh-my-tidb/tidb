@@ -120,22 +120,26 @@ func randGen(client *rawkv.Client, startKey, endKey []byte, maxLen int, concurre
 	const batchSize = 32
 
 	errCh := make(chan error, concurrency)
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		go func() {
 			for {
-				keys := make([][]byte, 0, batchSize)
-				values := make([][]byte, 0, batchSize)
+				// FIXME: because of the incompatibility of `BatchPut`,
+				//        we must use RawPut here. See https://github.com/tikv/client-go/pull/403.
+				//        Once the client get fixed, we'd better use the BatchPut API back.
+				// keys := make([][]byte, 0, batchSize)
+				// values := make([][]byte, 0, batchSize)
 
-				for i := 0; i < batchSize; i++ {
+				for range batchSize {
 					key := randKey(startKey, endKey, maxLen)
-					keys = append(keys, key)
 					value := randValue()
-					values = append(values, value)
-				}
 
-				err := client.BatchPut(context.TODO(), keys, values, nil)
-				if err != nil {
-					errCh <- errors.Trace(err)
+					// keys = append(keys, key)
+					// values = append(values, value)
+					err := client.Put(context.Background(), key, value)
+
+					if err != nil {
+						errCh <- errors.Trace(err)
+					}
 				}
 			}
 		}()
@@ -158,6 +162,7 @@ func testRandKey(startKey, endKey []byte, maxLen int) {
 	}
 }
 
+//nolint:gosec
 func randKey(startKey, endKey []byte, maxLen int) []byte {
 Retry:
 	for { // Regenerate on fail
@@ -166,7 +171,7 @@ Retry:
 		upperUnbounded := false
 		lowerUnbounded := false
 
-		for i := 0; i < maxLen; i++ {
+		for i := range maxLen {
 			upperBound := 256
 			if !upperUnbounded {
 				if i >= len(endKey) {
@@ -208,9 +213,10 @@ Retry:
 	}
 }
 
+//nolint:gosec
 func randValue() []byte {
 	result := make([]byte, 0, 512)
-	for i := 0; i < 512; i++ {
+	for i := range 512 {
 		value := rand.Intn(257)
 		if value == 256 {
 			if i > 0 {
@@ -303,12 +309,17 @@ func put(client *rawkv.Client, dataStr string) error {
 
 		keys = append(keys, key)
 		values = append(values, value)
+		// FIXME: because of the incompatibility of `BatchPut`,
+		//        we must use RawPut here. See https://github.com/tikv/client-go/pull/403.
+		//        Once the client get fixed, we'd better use the BatchPut API back.
+		if err := client.Put(context.Background(), key, value); err != nil {
+			return err
+		}
 	}
 
 	log.Info("Put rawkv data", zap.ByteStrings("keys", keys), zap.ByteStrings("values", values))
 
-	err := client.BatchPut(context.TODO(), keys, values, nil)
-	return errors.Trace(err)
+	return nil
 }
 
 const defaultScanBatchSize = 128
